@@ -1,8 +1,10 @@
+
 name: Android Build
 
 on:
   push:
     branches: [main, develop]
+    tags: ['v*']
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
@@ -15,6 +17,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,7 +26,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -31,10 +34,33 @@ jobs:
       - name: Setup Gradle
         uses: gradle/gradle-build-action@v3
         with:
-          gradle-version: "8.7"
+          gradle-version: '8.7'
 
       - name: Make gradlew executable
-        run: chmod +x ./gradlew || true
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+          fi
+
+      - name: Check signing configuration
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [[ -n "$KEYSTORE_BASE64" &&
+                -n "$KEYSTORE_PASSWORD" &&
+                -n "$KEY_ALIAS" &&
+                -n "$KEY_PASSWORD" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "Release signing configuration is available."
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets are incomplete. Debug APK will still be built."
+          fi
 
       - name: Build Debug APK
         run: gradle :app:assembleDebug --stacktrace
@@ -45,8 +71,10 @@ jobs:
           name: vexedit-studio-debug-${{ github.run_number }}
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Build Release APK (unsigned unless secrets provided)
+      - name: Build Release APK
+        if: steps.signing.outputs.configured == 'true'
         run: gradle :app:assembleRelease --stacktrace
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -54,27 +82,61 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      - name: Sign Release APK (if secrets provided)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      - name: Sign Release APK
+        if: steps.signing.outputs.configured == 'true'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
-          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
-            -keystore release.keystore \
-            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            app/build/outputs/apk/release/*.apk \
-            "${{ secrets.KEY_ALIAS }}" || true
+          set -euo pipefail
+
+          APK="$(find app/build/outputs/apk/release \
+            -maxdepth 1 -type f -name '*.apk' \
+            ! -name '*-signed.apk' -print -quit)"
+
+          if [[ -z "$APK" ]]; then
+            echo "ERROR: Release APK not found."
+            exit 1
+          fi
+
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          SIGNED_APK="${APK%.apk}-signed.apk"
+
+          trap 'rm -f "$KEYSTORE"' EXIT
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          test -s "$KEYSTORE"
+
+          apksigner sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "$SIGNED_APK" \
+            "$APK"
+
+          apksigner verify --verbose "$SIGNED_APK"
+
+          mv "$SIGNED_APK" "$APK"
+          echo "Release APK signed and verified successfully."
 
       - name: Upload Release APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vexedit-studio-release-${{ github.run_number }}
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: warn
+          retention-days: 14
 
-      - name: Create GitHub Release on tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request' && steps.signing.outputs.configured == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: app/build/outputs/apk/release/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
